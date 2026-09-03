@@ -199,6 +199,11 @@ _ALWAYS_BLOCKED_NETWORKS = (
 # to 198.18.0.0/15 behind local proxy/benchmark infrastructure.
 _TRUSTED_PRIVATE_IP_HOSTS = frozenset({
     "multimedia.nt.qq.com.cn",
+    # WeCom AI-bot media bucket (image/file messages sent to the bot).
+    # Same proxy fake-IP situation as QQ media above: on this machine the
+    # domain resolves to 198.18.0.x, which the SSRF guard otherwise blocks —
+    # image-only and mixed messages then arrive with zero media.
+    "ww-aibot-img-1258476243.cos.ap-guangzhou.myqcloud.com",
 })
 
 _MAX_SSRF_CONNECT_IPS = 8
