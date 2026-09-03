@@ -79,7 +79,13 @@ def is_protected_builtin(skill_name: str) -> bool:
 
 
 def _skills_dir() -> Path:
-    return get_hermes_home() / "skills"
+    public_dir = get_hermes_home() / "skills"
+    try:
+        from agent.work_scope import current_user_skills_dir
+
+        return current_user_skills_dir(public_dir.parent) or public_dir
+    except Exception:
+        return public_dir
 
 
 def _usage_file() -> Path:

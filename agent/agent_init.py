@@ -960,6 +960,10 @@ def init_agent(
     agent._session_activity_last_persist_mono: float = 0.0
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
+    # Replaced at the start of each conversation turn by the low-overhead
+    # performance accumulator; kept here so extracted executors can probe it
+    # safely on agents created outside the normal run path.
+    agent._turn_performance = None
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).
     # Set on internal forks (e.g. background_review) that must keep ``tools[]``
     # byte-identical to a parent for provider cache parity.

@@ -302,6 +302,38 @@ def _cron_referenced_skills() -> Set[str]:
         return set()
 
 
+def _routing_referenced_skills() -> Set[str]:
+    """Skill names referenced by profile routing docs (AGENTS.md / MEMORY.md /
+    references/cases.md / cron/jobs.json).
+
+    The curator archives skills by *usage telemetry*, but routing docs are never
+    re-written by the curator — a skill that MEMORY's route table or cases.md
+    still points at is in use by definition and must not be auto-archived.
+    2026-09-02: added after pop-seller-center-login was archived while
+    MEMORY.md/cases.md still routed to it.
+    """
+    home = get_hermes_home()
+    files = [home / "AGENTS.md", home / "memories" / "MEMORY.md",
+             home / "references" / "cases.md", home / "cron" / "jobs.json"]
+    found: Set[str] = set()
+    for f in files:
+        if not f.exists():
+            continue
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for name in re.findall(r"\b([A-Za-z][A-Za-z0-9_-]{2,60})\b", text):
+            found.add(name)
+    return found
+
+
+def _routing_references_name(name: str, refs: Set[str]) -> bool:
+    """Whether ``name`` is referenced by the routing docs (exact token
+    equality; conservative — false positives just skip an archive)."""
+    return name in refs
+
+
 def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int]:
     """Walk every curator-managed skill and move active/stale/archived based on
     the latest real activity timestamp. Pinned skills are never touched.
@@ -322,8 +354,10 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
     archive_cutoff = now - timedelta(days=get_archive_after_days())
 
     cron_referenced = _cron_referenced_skills()
+    routing_refs = _routing_referenced_skills()
 
-    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0, "seeded": 0}
+    counts = {"marked_stale": 0, "archived": 0, "reactivated": 0, "checked": 0,
+              "seeded": 0, "skipped_routing_referenced": 0}
 
     for row in _u.curated_report():
         counts["checked"] += 1
@@ -369,6 +403,13 @@ def apply_automatic_transitions(now: Optional[datetime] = None) -> Dict[str, int
             continue
 
         if anchor <= archive_cutoff and current != _u.STATE_ARCHIVED:
+            # Routing-doc guard: a skill still referenced by AGENTS.md /
+            # MEMORY.md / cases.md / cron/jobs.json is in use by definition.
+            # (2026-09-02: pop-seller-center-login was archived while route
+            # tables still pointed at it.)
+            if _routing_references_name(name, routing_refs):
+                counts["skipped_routing_referenced"] += 1
+                continue
             # Tag the ledger entry with the curator actor: this archive is an
             # autonomous curator transition, not a foreground agent/user call.
             try:
@@ -464,6 +505,15 @@ CURATOR_REVIEW_PROMPT = (
     "run. You MAY still consolidate it into an umbrella — but only because "
     "the curator rewrites cron job skill references to follow consolidations; "
     "never simply prune it.\n"
+    "3d. ROUTING-REFERENCE GUARD: before archiving/pruning ANY skill, grep "
+    "the profile routing docs (AGENTS.md, memories/MEMORY.md, "
+    "references/cases.md, cron/jobs.json) for its name. If it appears "
+    "anywhere there, it is in use by definition — do NOT archive/absorb it; "
+    "note in the report that routing must be updated first, and leave the "
+    "skill in place. (2026-09-02: pop-seller-center-login was archived while "
+    "MEMORY/cases still routed to it.) The same applies to ABSORBED skills: "
+    "if you absorb one, you MUST also report every routing doc line that "
+    "referenced it so a human can re-point it.\n"
     "4. DO NOT use usage counters as a reason to skip consolidation. The "
     "counters are new and often mostly zero. Judge overlap on CONTENT, "
     "not on use_count. 'use=0' is not evidence a skill is valuable; it's "

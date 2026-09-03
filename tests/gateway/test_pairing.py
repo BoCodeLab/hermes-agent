@@ -80,6 +80,20 @@ class TestProfileScopedDiscovery:
         assert [r["user_id"] for r in approved] == ["tg-456"]
         assert approved[0]["platform"] == "telegram"
 
+    def test_approve_user_grants_without_a_pairing_code(self, tmp_path):
+        with patch("gateway.pairing.PAIRING_DIR", tmp_path):
+            store = PairingStore()
+
+            result = store.approve_user("wecom", "wecom-user", "Alice")
+
+            assert result == {
+                "platform": "wecom",
+                "user_id": "wecom-user",
+                "user_name": "Alice",
+            }
+            assert store.is_approved("wecom", "wecom-user") is True
+            assert store.list_pending("wecom") == []
+
 
 # ---------------------------------------------------------------------------
 # _secure_write
@@ -676,5 +690,4 @@ class TestProfileScopedStorage:
             / "pairing"
             / "_rate_limits.json"
         )
-
 

@@ -31,7 +31,6 @@ from agent.skill_utils import (
     SKILL_SUPPORT_DIRS,
     extract_skill_conditions,
     extract_skill_description,
-    get_all_skills_dirs,
     get_disabled_skill_names,
     iter_skill_index_files,
     org_id_of_path,
@@ -1782,7 +1781,14 @@ def build_skills_system_prompt(
         skills_dir = get_skills_dir()
         _home_token = None
     try:
-        external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        from agent.skill_utils import get_session_skills_dirs
+
+        # In the Work profile a WeCom user's private skills root is the local
+        # tier for this session; the profile's existing skills root remains the
+        # public fallback tier. Other profiles return the historical roots.
+        session_skill_dirs = get_session_skills_dirs()
+        skills_dir = session_skill_dirs[0]
+        external_dirs = session_skill_dirs[1:]
         # Trusted project-local dirs (./.hermes/skills, ./.agents/skills at
         # the git root) — highest-precedence tier, scanned before local.
         # Resolved once here; cwd and trust are stable for the session, so

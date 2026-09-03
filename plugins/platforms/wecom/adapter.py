@@ -208,6 +208,14 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
+        self._reply_stream_ids: Dict[str, str] = {}
+        # WeCom reply frames for one inbound request must be serialized. The
+        # typing stream and the final message share the inbound req_id in the
+        # response correlation map; concurrent frames would overwrite each
+        # other's future and leave only the typing bubble visible.
+        self._reply_request_locks: Dict[str, asyncio.Lock] = {}
+        self._finalizing_reply_req_ids: set[str] = set()
+        self._finished_reply_req_ids: set[str] = set()
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -297,6 +305,10 @@ class WeComAdapter(BasePlatformAdapter):
             self._http_client = None
 
         self._dedup.clear()
+        self._reply_stream_ids.clear()
+        self._reply_request_locks.clear()
+        self._finalizing_reply_req_ids.clear()
+        self._finished_reply_req_ids.clear()
         logger.info("[%s] Disconnected", self.name)
 
     async def _cleanup_ws(self) -> None:
@@ -485,16 +497,37 @@ class WeComAdapter(BasePlatformAdapter):
         if not normalized_req_id:
             raise ValueError("reply_req_id is required")
 
-        future = asyncio.get_running_loop().create_future()
-        self._pending_responses[normalized_req_id] = future
-        try:
-            await self._send_json(
-                {"cmd": cmd, "headers": {"req_id": normalized_req_id}, "body": body}
+        lock = self._reply_request_locks.get(normalized_req_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._reply_request_locks[normalized_req_id] = lock
+
+        async with lock:
+            body_stream = body.get("stream") if isinstance(body, dict) else None
+            is_open_typing_frame = bool(
+                isinstance(body_stream, dict)
+                and body.get("msgtype") == "stream"
+                and body_stream.get("finish") is False
             )
-            response = await asyncio.wait_for(future, timeout=timeout)
-            return response
-        finally:
-            self._pending_responses.pop(normalized_req_id, None)
+            if is_open_typing_frame and (
+                normalized_req_id in self._finalizing_reply_req_ids
+                or normalized_req_id in self._finished_reply_req_ids
+            ):
+                # A fast final reply may win the lock before the typing task
+                # starts. Return a successful local acknowledgement so the
+                # late typing call cannot create a new bubble.
+                return {"errcode": 0, "_hermes_typing_skipped": True}
+            future = asyncio.get_running_loop().create_future()
+            self._pending_responses[normalized_req_id] = future
+            try:
+                await self._send_json(
+                    {"cmd": cmd, "headers": {"req_id": normalized_req_id}, "body": body}
+                )
+                response = await asyncio.wait_for(future, timeout=timeout)
+                return response
+            finally:
+                if self._pending_responses.get(normalized_req_id) is future:
+                    self._pending_responses.pop(normalized_req_id, None)
 
     @staticmethod
     def _new_req_id(prefix: str) -> str:
@@ -728,6 +761,9 @@ class WeComAdapter(BasePlatformAdapter):
         elif quote_type == "voice":
             quote_voice = quote.get("voice") if isinstance(quote.get("voice"), dict) else {}
             reply_text = str(quote_voice.get("content") or "").strip() or None
+        elif quote_type == "markdown":
+            quote_markdown = quote.get("markdown") if isinstance(quote.get("markdown"), dict) else {}
+            reply_text = str(quote_markdown.get("content") or "").strip() or None
 
         return "\n".join(part for part in text_parts if part).strip(), reply_text
 
@@ -1307,6 +1343,28 @@ class WeComAdapter(BasePlatformAdapter):
         self._raise_for_wecom_error(response, "send reply markdown")
         return response
 
+    async def _send_reply_stream(
+        self,
+        reply_req_id: str,
+        stream_id: str,
+        content: str,
+        *,
+        finish: bool,
+    ) -> Dict[str, Any]:
+        response = await self._send_reply_request(
+            reply_req_id,
+            {
+                "msgtype": "stream",
+                "stream": {
+                    "id": stream_id,
+                    "finish": finish,
+                    "content": content[:self.MAX_MESSAGE_LENGTH],
+                },
+            },
+        )
+        self._raise_for_wecom_error(response, "send reply stream")
+        return response
+
     async def _send_reply_media_message(
         self,
         reply_req_id: str,
@@ -1427,19 +1485,41 @@ class WeComAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send markdown to a WeCom chat via proactive ``aibot_send_msg``."""
-        del metadata
+        force_proactive = bool(
+            isinstance(metadata, dict) and metadata.get("wecom_force_proactive")
+        )
 
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
 
+        reply_req_id = None
+        stream_id = None
+        finalizing_reply_req_id = None
         try:
-            reply_req_id = self._reply_req_id_for_message(reply_to)
+            reply_req_id = (
+                None if force_proactive else self._reply_req_id_for_message(reply_to)
+            )
 
-            if not reply_req_id and chat_id in self._last_chat_req_ids:
+            if (
+                not force_proactive
+                and not reply_req_id
+                and chat_id in self._last_chat_req_ids
+            ):
                 reply_req_id = self._last_chat_req_ids[chat_id]
 
             if reply_req_id:
-                response = await self._send_reply_markdown(reply_req_id, content)
+                self._finalizing_reply_req_ids.add(reply_req_id)
+                finalizing_reply_req_id = reply_req_id
+                stream_id = self._reply_stream_ids.get(reply_req_id)
+                if stream_id:
+                    response = await self._send_reply_stream(
+                        reply_req_id,
+                        stream_id,
+                        content,
+                        finish=True,
+                    )
+                else:
+                    response = await self._send_reply_markdown(reply_req_id, content)
             else:
                 response = await self._send_request(
                     APP_CMD_SEND,
@@ -1450,14 +1530,36 @@ class WeComAdapter(BasePlatformAdapter):
                     },
                 )
         except asyncio.TimeoutError:
+            if finalizing_reply_req_id:
+                self._finalizing_reply_req_ids.discard(finalizing_reply_req_id)
+            logger.warning(
+                "[%s] Reply request timed out while sending final content",
+                self.name,
+            )
             return SendResult(success=False, error="Timeout sending message to WeCom")
+        except asyncio.CancelledError:
+            if finalizing_reply_req_id:
+                self._finalizing_reply_req_ids.discard(finalizing_reply_req_id)
+            raise
         except Exception as exc:
+            if finalizing_reply_req_id:
+                self._finalizing_reply_req_ids.discard(finalizing_reply_req_id)
             logger.error("[%s] Send failed: %s", self.name, exc)
             return SendResult(success=False, error=str(exc))
 
         error = self._response_error(response)
         if error:
+            if finalizing_reply_req_id:
+                self._finalizing_reply_req_ids.discard(finalizing_reply_req_id)
             return SendResult(success=False, error=error)
+        if reply_req_id:
+            self._finalizing_reply_req_ids.discard(reply_req_id)
+            self._finished_reply_req_ids.add(reply_req_id)
+            if len(self._finished_reply_req_ids) > DEDUP_MAX_SIZE:
+                self._finished_reply_req_ids.pop()
+            # Remove a stream claimed by a racing typing task as well as the
+            # stream used by this send, so a completed reply cannot be revived.
+            self._reply_stream_ids.pop(reply_req_id, None)
 
         return SendResult(
             success=True,
@@ -1555,8 +1657,36 @@ class WeComAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """WeCom does not expose typing indicators in this adapter."""
-        del chat_id, metadata
+        """Start an empty reply stream so WeCom renders its native busy bubble."""
+        reply_to = metadata.get("wecom_reply_to_message_id") if isinstance(metadata, dict) else None
+        reply_req_id = self._reply_req_id_for_message(reply_to)
+        if not reply_req_id:
+            reply_req_id = self._last_chat_req_ids.get(chat_id)
+        if (
+            not reply_req_id
+            or reply_req_id in self._reply_stream_ids
+            or reply_req_id in self._finalizing_reply_req_ids
+            or reply_req_id in self._finished_reply_req_ids
+        ):
+            return
+
+        stream_id = self._new_req_id("stream")
+        self._reply_stream_ids[reply_req_id] = stream_id
+        try:
+            await self._send_reply_stream(reply_req_id, stream_id, "", finish=False)
+            if (
+                reply_req_id in self._finalizing_reply_req_ids
+                or reply_req_id in self._finished_reply_req_ids
+            ):
+                if self._reply_stream_ids.get(reply_req_id) == stream_id:
+                    self._reply_stream_ids.pop(reply_req_id, None)
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._reply_stream_ids.get(reply_req_id) == stream_id:
+                self._reply_stream_ids.pop(reply_req_id, None)
+            logger.debug("[%s] Failed to start reply stream: %s", self.name, exc)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return minimal chat info."""

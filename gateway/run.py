@@ -16084,6 +16084,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
+            # Never spool a work-account initialization payload while replay
+            # recovery is active: it can contain credentials and must be sent
+            # again only after the gateway is ready to handle it directly.
+            try:
+                from gateway.work_user_gate import (
+                    is_initialization_request,
+                    is_work_user_gate_enabled,
+                )
+
+                if (
+                    getattr(getattr(source, "platform", None), "value", None)
+                    == "wecom"
+                    and is_work_user_gate_enabled(source)
+                    and is_initialization_request(event.text)
+                ):
+                    return "网关正在恢复，请稍后重新发送账号初始化。"
+            except Exception:
+                pass
             self._queue_startup_restore_event(event)
             return None
 
@@ -16103,11 +16121,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
+            _hook_event = event
+            # Work-account initialization may contain credentials. Keep the
+            # raw payload out of pre-dispatch hooks and observer plugins.
+            try:
+                from gateway.work_user_gate import (
+                    is_initialization_request,
+                    is_work_user_gate_enabled,
+                )
+
+                if (
+                    getattr(getattr(source, "platform", None), "value", None)
+                    == "wecom"
+                    and is_work_user_gate_enabled(source)
+                    and is_initialization_request(event.text)
+                ):
+                    _hook_event = dataclasses.replace(
+                        event,
+                        text="[work account initialization payload redacted]",
+                        raw_message=None,
+                        reply_to_text=None,
+                    )
+            except Exception:
+                _hook_event = event
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
                     "pre_gateway_dispatch",
-                    event=event,
+                    event=_hook_event,
                     gateway=self,
                     # getattr: bare-runner tests build GatewayRunner via
                     # object.__new__ without __init__ (pitfall #17), and the
@@ -16139,7 +16180,110 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
+        # Work-profile WeCom access is approved by the configured home-channel
+        # administrator, not by a user-facing pairing code. Handle this before
+        # the generic authorization branch so new users can submit a private
+        # account request and the administrator can reply in WeCom.
+        _work_user_gate_enabled = False
+        _work_user_authorized = False
+        _work_init_request = False
+        _work_access_control_request = False
+        if not is_internal:
+            try:
+                from gateway.work_user_gate import (
+                    handle_work_access_request,
+                    is_initialization_request,
+                    is_work_access_control_request,
+                    is_work_user_gate_enabled,
+                )
+
+                _work_user_gate_enabled = is_work_user_gate_enabled(source)
+                if _work_user_gate_enabled:
+                    _work_init_request = is_initialization_request(event.text)
+                    _work_access_control_request = is_work_access_control_request(event.text)
+                    _work_home = self.config.get_home_channel(Platform.WECOM)
+                    _work_manager_user_id = str(
+                        getattr(_work_home, "user_id", None) or ""
+                    ).strip()
+                    _work_manager_chat_id = str(
+                        getattr(_work_home, "chat_id", None)
+                        or _work_manager_user_id
+                    ).strip()
+                    _work_user_authorized = self._is_user_authorized(source)
+                    _work_is_manager = bool(
+                        _work_manager_user_id
+                        and str(source.user_id or "").strip() == _work_manager_user_id
+                    )
+                    _work_user_authorized = _work_user_authorized or _work_is_manager
+                    async def _send_work_access_message(chat_id: str, content: str):
+                        work_adapter = self._adapter_for_source(source)
+                        if work_adapter is None:
+                            return False
+                        return await work_adapter.send(
+                            chat_id,
+                            content,
+                            metadata={"wecom_force_proactive": True},
+                        )
+
+                    _work_pairing_store = self._pairing_store_for(source)
+
+                    def _grant_work_access(user_id: str, user_name: str = "") -> bool:
+                        if _work_pairing_store is None or not user_id:
+                            return False
+                        _work_pairing_store.approve_user("wecom", user_id, user_name)
+                        return True
+
+                    def _schedule_work_access_task(coro) -> None:
+                        task = asyncio.create_task(coro)
+                        tasks = getattr(self, "_background_tasks", None)
+                        if not isinstance(tasks, set):
+                            tasks = set()
+                            self._background_tasks = tasks
+                        tasks.add(task)
+
+                        def _work_access_done(done_task):
+                            tasks.discard(done_task)
+                            if done_task.cancelled():
+                                return
+                            try:
+                                error = done_task.exception()
+                            except Exception:
+                                error = None
+                            if error is not None:
+                                logger.error(
+                                    "work access completion task failed: %s", error
+                                )
+
+                        task.add_done_callback(_work_access_done)
+
+                    _work_access_reply = await handle_work_access_request(
+                        source,
+                        event.text,
+                        event.reply_to_text,
+                        authorized=_work_user_authorized,
+                        manager_user_id=_work_manager_user_id,
+                        manager_chat_id=_work_manager_chat_id,
+                        send_message=_send_work_access_message,
+                        grant_access=_grant_work_access,
+                        schedule_task=_schedule_work_access_task,
+                    )
+                    if _work_access_reply is not None:
+                        return _work_access_reply
+            except Exception as _work_access_err:
+                logger.error("work access gate failed closed: %s", _work_access_err)
+                if _work_user_gate_enabled and (
+                    _work_init_request
+                    or _work_access_control_request
+                    or (
+                        source.chat_type in {"dm", "private", "direct"}
+                        and not _work_user_authorized
+                    )
+                ):
+                    return "账号接入审批暂时不可用，请稍后重试。"
+
         if is_internal:
+            pass
+        elif _work_user_gate_enabled and _work_user_authorized:
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
@@ -16208,6 +16352,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # The work profile uses one Hermes profile with per-WeCom-user account
+        # files. Unknown users are stopped before any agent/tool work. The
+        # initialization command is handled directly and never reaches the LLM.
+        if not is_internal:
+            try:
+                from gateway.work_user_gate import (
+                    check_work_user,
+                    initialize_work_user,
+                    is_initialization_request,
+                )
+
+                if is_initialization_request(event.text):
+                    _work_user_reply = await initialize_work_user(source, event.text)
+                else:
+                    _work_user_reply = check_work_user(source, event.text)
+            except Exception as _work_user_gate_err:
+                logger.error("work user gate failed closed: %s", _work_user_gate_err)
+                _work_user_reply = "当前企微用户未完成账号初始化，暂不能查询。"
+            if _work_user_reply is not None:
+                return _work_user_reply
 
         # Global emergency stop (`hermes pause`): give new turns a brief
         # paused notice instead of starting an agent run. Internal events

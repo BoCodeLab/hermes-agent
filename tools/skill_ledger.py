@@ -88,10 +88,26 @@ def derive_actor() -> str:
 # ---------------------------------------------------------------------------
 
 def ledger_path() -> Path:
-    return get_hermes_home() / "skills" / ".curator_ledger.jsonl"
+    public_dir = get_hermes_home() / "skills"
+    try:
+        from agent.work_scope import current_user_skills_dir
+
+        root = current_user_skills_dir(public_dir.parent) or public_dir
+    except Exception:
+        root = public_dir
+    return root / ".curator_ledger.jsonl"
 
 
 def blobs_dir() -> Path:
+    public_dir = get_hermes_home() / "skills"
+    try:
+        from agent.work_scope import current_user_skills_dir
+
+        user_root = current_user_skills_dir(public_dir.parent)
+    except Exception:
+        user_root = None
+    if user_root is not None:
+        return user_root.parent / ".curator_backups" / "blobs"
     return get_hermes_home() / ".curator_backups" / "blobs"
 
 

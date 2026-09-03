@@ -54,6 +54,17 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 logger = logging.getLogger(__name__)
 
 
+def _record_tool_performance(agent, name: str, duration_seconds: float, *, success: bool) -> None:
+    """Forward tool timing to the active turn without making it mandatory."""
+    performance = getattr(agent, "_turn_performance", None)
+    recorder = getattr(performance, "record_tool", None)
+    if callable(recorder):
+        try:
+            recorder(name, duration_seconds, success=success)
+        except Exception:
+            logger.debug("tool performance recording failed for %s", name, exc_info=True)
+
+
 def _ensure_file_checkpoint(
     agent,
     function_name: str,
@@ -1748,6 +1759,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
+            _record_tool_performance(
+                agent,
+                name,
+                tool_duration,
+                success=not is_error,
+            )
+
             if agent.verbose_logging:
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
@@ -2561,6 +2579,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
+
+        _record_tool_performance(
+            agent,
+            function_name,
+            tool_duration,
+            success=not _is_error_result,
+        )
 
         agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""

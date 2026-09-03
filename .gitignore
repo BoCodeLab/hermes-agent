@@ -38,6 +38,14 @@ data/
 .pytest_cache/
 test_durations.json
 .pytest-cache/
+# ---- 本地定制 (hermes-work) ----
+# 运行时状态(设备配对各数据),不进版本库
+.mimosa/
+# 本地启动器/可执行产物(bin/hermes-work.cmd 等装机生成物)
+bin/
+# 腾讯云记忆插件是外部开发仓库,经 junction 挂载(真实代码在
+# D:\coding\TencentDB-Agent-Memory),不随本仓库提交;新机器用 mklink 重建。
+plugins/memory/memory_tencentdb/
 tmp/
 temp_vision_images/
 hermes-*/*

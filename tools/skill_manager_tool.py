@@ -3,9 +3,10 @@
 Skill Manager Tool -- Agent-Managed Skill Creation & Editing
 
 Allows the agent to create, update, and delete skills, turning successful
-approaches into reusable procedural knowledge. New skills are created in
-~/.hermes/skills/. Existing skills (bundled, hub-installed, or user-created)
-can be modified or deleted wherever they live.
+approaches into reusable procedural knowledge. New skills are created in the
+current Work user's private root for a scoped WeCom session, and in the public
+``~/.hermes/skills/`` root for other sessions. Work users may modify or delete
+only private skills; an administrator CLI session may maintain public skills.
 
 Skills are the agent's procedural memory: they capture *how to do a specific
 type of task* based on proven experience. General memory (MEMORY.md, USER.md) is
@@ -171,6 +172,48 @@ def _skills_dir() -> Path:
         return configured
     return get_hermes_home() / "skills"
 
+
+def _session_skill_dirs() -> list[Path]:
+    """Return user-first skill roots for the current session."""
+    from agent.skill_utils import get_all_skills_dirs
+
+    roots = get_all_skills_dirs()
+    user_root = _current_user_skills_dir()
+    return [user_root, *roots] if user_root is not None else roots
+
+
+def _writable_skills_dir() -> Path:
+    """Return the mutable root for a new skill in this session."""
+    from agent.work_scope import writable_skills_dir
+
+    return writable_skills_dir(_skills_dir())
+
+
+def _current_user_skills_dir() -> Path | None:
+    """Return the current Work user's private root, when one is active."""
+    from agent.work_scope import current_user_skills_dir
+
+    return current_user_skills_dir(_skills_dir().parent)
+
+
+def _public_skill_mutation_guard(skill_path: Path, action: str) -> Optional[Dict[str, Any]]:
+    """Prevent a Work user from mutating the shared public skill tier."""
+    user_root = _current_user_skills_dir()
+    if user_root is None:
+        return None
+    try:
+        skill_path.resolve().relative_to(user_root.resolve())
+    except (OSError, ValueError):
+        return {
+            "success": False,
+            "error": (
+                f"Cannot {action} a public skill from a Work user session. "
+                "Create a personal copy first or use the administrator CLI to "
+                "change the public skill."
+            ),
+        }
+    return None
+
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 
@@ -181,14 +224,12 @@ def _containing_skills_root(skill_path: Path) -> Path:
     match is found (defensive — callers should have located the skill via
     ``_find_skill`` first).
     """
-    from agent.skill_utils import get_all_skills_dirs
-
     try:
         resolved = skill_path.resolve()
     except OSError:
         resolved = skill_path
 
-    for root in get_all_skills_dirs():
+    for root in _session_skill_dirs():
         try:
             resolved.relative_to(root.resolve())
             return root
@@ -229,8 +270,6 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
 
     Returns an error string to refuse on, or ``None`` when the delete is safe.
     """
-    from agent.skill_utils import get_all_skills_dirs
-
     # (3) Reject symlink/junction redirects on the skill directory itself.
     if _is_path_redirect(skill_dir):
         return (
@@ -244,7 +283,7 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
         return f"Refusing to delete '{skill_dir}': could not resolve path ({exc})."
 
     roots = []
-    for root in get_all_skills_dirs():
+    for root in _session_skill_dirs():
         try:
             roots.append(root.resolve())
         except OSError:
@@ -637,9 +676,10 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
 
 def _resolve_skill_dir(name: str, category: str = None) -> Path:
     """Build the directory path for a new skill, optionally under a category."""
+    root = _writable_skills_dir()
     if category:
-        return _skills_dir() / category / name
-    return _skills_dir() / name
+        return root / category / name
+    return root / name
 
 
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
@@ -650,8 +690,8 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
     """
-    from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
-    for skills_dir in get_all_skills_dirs():
+    from agent.skill_utils import is_excluded_skill_path
+    for skills_dir in _session_skill_dirs():
         if not skills_dir.exists():
             continue
         for skill_md in skills_dir.rglob("SKILL.md"):
@@ -928,12 +968,23 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     # Check for name collisions across all directories
     existing = _find_skill(name)
     if existing:
-        return {
-            "success": False,
-            "error": f"A skill named '{name}' already exists at {existing['path']}."
-        }
+        user_root = _current_user_skills_dir()
+        if user_root is not None:
+            try:
+                existing["path"].resolve().relative_to(user_root.resolve())
+            except (OSError, ValueError):
+                # A Work user may personalize a public skill by creating a
+                # same-named private copy; the private tier wins on lookup.
+                existing = None
+        if existing:
+            return {
+                "success": False,
+                "error": f"A skill named '{name}' already exists at {existing['path']}."
+            }
 
-    # Create the skill directory
+    # Create the skill directory in the current Work user's private root when
+    # this call belongs to a scoped WeCom session; the existing profile skills
+    # directory remains the public tier for all users.
     skill_dir = _resolve_skill_dir(name, category)
     skill_dir.mkdir(parents=True, exist_ok=True)
 
@@ -960,7 +1011,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
-        "path": str(skill_dir.relative_to(_skills_dir())),
+        "path": str(skill_dir.relative_to(_writable_skills_dir())),
         "skill_md": str(skill_md),
         "_change": {"description": _desc},
     }
@@ -1016,6 +1067,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    guard = _public_skill_mutation_guard(existing["path"], "edit")
+    if guard:
+        return guard
     org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
     if org_guard:
         return org_guard
@@ -1087,6 +1141,9 @@ def _patch_skill(
         return {"success": False, "error": _skill_not_found_error(name)}
 
     skill_dir = existing["path"]
+    guard = _public_skill_mutation_guard(skill_dir, "patch")
+    if guard:
+        return guard
     org_guard = _org_mirror_write_guard(name, skill_dir, "patch")
     if org_guard:
         return org_guard
@@ -1200,6 +1257,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    guard = _public_skill_mutation_guard(existing["path"], "delete")
+    if guard:
+        return guard
     org_guard = _org_mirror_write_guard(name, existing["path"], "delete")
     if org_guard:
         return org_guard
@@ -1320,6 +1380,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
+    guard = _public_skill_mutation_guard(existing["path"], "write_file")
+    if guard:
+        return guard
     org_guard = _org_mirror_write_guard(name, existing["path"], "write_file")
     if org_guard:
         return org_guard
@@ -1372,6 +1435,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    guard = _public_skill_mutation_guard(existing["path"], "remove_file")
+    if guard:
+        return guard
 
     skill_dir = existing["path"]
     guard = _background_review_write_guard(name, skill_dir, "remove_file")
@@ -1711,7 +1777,7 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
+        f"New skills go to {display_hermes_home()}/skills/ (or the current Work user's private skills root in a WeCom session). Work users may modify only private skills; administrator CLI sessions may maintain public skills.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "

@@ -554,6 +554,12 @@ class PairingStore:
         # visible source of truth. No-op on open gateways.
         _sync_allowlist_add(platform, normalized_user_id)
 
+    def approve_user(self, platform: str, user_id: str, user_name: str = "") -> dict:
+        """Grant access to a known user without requiring a pairing code."""
+        with self._lock:
+            self._approve_user(platform, user_id, user_name)
+        return {"platform": platform, "user_id": user_id, "user_name": user_name}
+
     def revoke(self, platform: str, user_id: str) -> bool:
         """Remove a user from the approved list. Returns True if found."""
         path = self._approved_path(platform)

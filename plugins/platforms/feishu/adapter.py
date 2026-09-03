@@ -3079,12 +3079,20 @@ class FeishuAdapter(BasePlatformAdapter):
         action_tag = str(getattr(action, "tag", "") or "button")
         action_value = getattr(action, "value", {}) or {}
 
-        synthetic_text = f"/card {action_tag}"
-        if action_value:
-            try:
-                synthetic_text += f" {json.dumps(action_value, ensure_ascii=False)}"
-            except Exception:
-                pass
+        # 将卡片按钮动作翻译成 agent 可读的指令，作为普通消息交给 agent 处理，
+        # 避免 gateway 把 /card 当作未知斜杠命令而拒绝（Unrecognized slash command /card）。
+        action_key = action_value.get("action") if isinstance(action_value, dict) else None
+        if action_key == "refresh_balance":
+            action_label = (
+                "有用户点击了「刷新余额」按钮。请重新查询 AI 中转站余额，用最新数据渲染卡片，"
+                "并把最新卡片发送到本群。发送成功后请直接结束，正文不要输出任何文字——"
+                "不要写『已刷新』，不要复述任何金额/请求数/token/消费等数字或统计。"
+            )
+        elif isinstance(action_value, dict) and action_value:
+            action_label = f"有用户进行了卡片交互（{action_tag}），参数：{json.dumps(action_value, ensure_ascii=False)}"
+        else:
+            action_label = f"有用户点击了卡片按钮（{action_tag}）"
+        synthetic_text = f"[卡片交互] {action_label}"
 
         sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
         sender_profile = await self._resolve_sender_profile(sender_id)
@@ -3100,12 +3108,16 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
-            message_type=MessageType.COMMAND,
+            message_type=MessageType.TEXT,
             source=source,
             raw_message=data,
-            message_id=token or str(uuid.uuid4()),
+            message_id=None,
             channel_prompt=self._resolve_channel_prompt(chat_id),
             timestamp=datetime.now(),
+            # 「刷新余额」等卡片交互：卡片由 agent 用工具独立发送，
+            # agent 剩余的纯文字回复（如“卡片已发送”）不应再发一条，
+            # 用标记让基类在发送前丢弃文本。
+            metadata={"suppress_text_reply": True} if action_key == "refresh_balance" else {},
         )
         logger.info("[Feishu] Routing card action %r from %s in %s as synthetic command", action_tag, open_id, chat_id)
         await self._handle_message_with_guards(synthetic_event)

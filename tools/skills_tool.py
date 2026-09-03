@@ -686,7 +686,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     after a short TTL to bound staleness from in-place SKILL.md edits.
     """
     from agent.skill_utils import (
-        get_external_skills_dirs,
+        get_session_skills_dirs,
         get_project_skills_dirs,
         iter_skill_index_files,
     )
@@ -702,11 +702,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # SKILLS_DIR can be stale in long-lived runtimes). Trusted project-local
     # dirs come FIRST: first-wins dedup below gives them precedence over
     # same-named local/external skills.
-    dirs_to_scan: list = list(get_project_skills_dirs())
     active_skills_dir = _skills_dir()
-    if active_skills_dir.exists():
-        dirs_to_scan.append(active_skills_dir)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    session_dirs = get_session_skills_dirs(active_skills_dir)
+    dirs_to_scan: list = list(get_project_skills_dirs())
+    dirs_to_scan.extend(session_dirs)
 
     signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
@@ -1200,7 +1199,7 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
+        from agent.skill_utils import get_session_skills_dirs, get_project_skills_dirs
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1220,11 +1219,10 @@ def skill_view(
         # they're the highest-precedence tier and the collision resolver
         # below uses this ordering.
         project_dirs = get_project_skills_dirs()
-        all_dirs = list(project_dirs)
         active_skills_dir = _skills_dir()
-        if active_skills_dir.exists():
-            all_dirs.append(active_skills_dir)
-        all_dirs.extend(get_external_skills_dirs())
+        all_dirs = list(project_dirs)
+        session_dirs = get_session_skills_dirs(active_skills_dir)
+        all_dirs.extend(session_dirs)
 
         if not all_dirs:
             return json.dumps(
@@ -1318,6 +1316,26 @@ def skill_view(
                     found_md
                 ):
                     _record(None, found_md)
+
+        # Work user skills intentionally shadow same-named public skills. This
+        # is the only cross-tier collision that resolves automatically; all
+        # other ambiguous matches keep the existing fail-loud behavior.
+        try:
+            from agent.work_scope import current_user_skills_dir
+
+            _user_skills_root = current_user_skills_dir(active_skills_dir.parent)
+        except Exception:
+            _user_skills_root = None
+        if len(candidates) > 1 and _user_skills_root is not None:
+            user_candidates = []
+            for candidate in candidates:
+                try:
+                    candidate[1].resolve().relative_to(_user_skills_root.resolve())
+                except (OSError, ValueError):
+                    continue
+                user_candidates.append(candidate)
+            if user_candidates:
+                candidates = user_candidates
 
         if len(candidates) > 1 and project_dirs:
             # Cross-tier collision resolution: a project skill intentionally

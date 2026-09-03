@@ -619,6 +619,20 @@ def get_all_skills_dirs() -> List[Path]:
     return dirs
 
 
+def get_session_skills_dirs(public_dir: Path | None = None) -> List[Path]:
+    """Return skill roots visible to the current session in precedence order.
+
+    Work WeCom users get a private mutable root before the profile's existing
+    public ``skills`` root. Other sessions retain the historical roots exactly.
+    External directories are appended as read-only sources.
+    """
+    from agent.work_scope import session_skill_dirs
+
+    roots = session_skill_dirs(public_dir or get_skills_dir())
+    roots.extend(get_external_skills_dirs())
+    return roots
+
+
 # ── Project-local skills directories ──────────────────────────────────────
 #
 # Repo-local skills, mirroring what OpenCode (.opencode/skill/, .agents/skills/)
@@ -984,7 +998,7 @@ def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
     seen_keys: set = set()
 
     disabled = get_disabled_skill_names()
-    for skills_dir in get_all_skills_dirs():
+    for skills_dir in get_session_skills_dirs():
         if not skills_dir.is_dir():
             continue
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):

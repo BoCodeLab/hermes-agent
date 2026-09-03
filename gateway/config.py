@@ -2374,11 +2374,15 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.WECOM].extra["websocket_url"] = wecom_ws_url
         wecom_home = getenv("WECOM_HOME_CHANNEL")
         if wecom_home:
+            existing_home = config.platforms[Platform.WECOM].home_channel
             config.platforms[Platform.WECOM].home_channel = HomeChannel(
                 platform=Platform.WECOM,
                 chat_id=wecom_home,
                 name=getenv("WECOM_HOME_CHANNEL_NAME", "Home"),
                 thread_id=getenv("WECOM_HOME_CHANNEL_THREAD_ID") or None,
+                # The env override changes the destination but must preserve
+                # the authenticated owner identity recorded in YAML.
+                user_id=getattr(existing_home, "user_id", None),
             )
 
     # WeCom callback mode (self-built apps)

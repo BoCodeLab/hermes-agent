@@ -1067,6 +1067,36 @@ class TestHomeChannelEnvOverrides:
             assert home is not None, f"{platform.value}: home_channel should not be None"
             assert (home.chat_id, home.name) == expected, platform.value
 
+    def test_wecom_home_channel_override_preserves_owner_user_id(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.WECOM: PlatformConfig(
+                    enabled=True,
+                    home_channel=HomeChannel(
+                        platform=Platform.WECOM,
+                        chat_id="yaml-chat",
+                        name="yaml-owner",
+                        user_id="manager-user",
+                    ),
+                )
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "WECOM_BOT_ID": "bot",
+                "WECOM_SECRET": "secret",
+                "WECOM_HOME_CHANNEL": "env-chat",
+            },
+            clear=True,
+        ):
+            _apply_env_overrides(config)
+
+        home = config.platforms[Platform.WECOM].home_channel
+        assert home is not None
+        assert home.chat_id == "env-chat"
+        assert home.user_id == "manager-user"
+
 
 class TestMultiplexProfilesEnvOverride:
     """GATEWAY_MULTIPLEX_PROFILES env override — the 3-tier precedence chain.

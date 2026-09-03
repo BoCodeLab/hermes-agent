@@ -46,6 +46,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_performance import TurnPerformance
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -1742,6 +1743,17 @@ def run_conversation(
         except Exception:
             pass
 
+    # Keep one lightweight timing accumulator for this turn.  It is attached
+    # to the agent so the extracted tool executor can record the same trace.
+    _turn_performance = TurnPerformance()
+    _turn_performance.set_usage_baseline({
+        "prompt_tokens": getattr(agent, "session_prompt_tokens", 0),
+        "input_tokens": getattr(agent, "session_input_tokens", 0),
+        "output_tokens": getattr(agent, "session_output_tokens", 0),
+        "reasoning_tokens": getattr(agent, "session_reasoning_tokens", 0),
+    })
+    agent._turn_performance = _turn_performance
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
@@ -1790,28 +1802,29 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
-    _ctx = build_turn_context(
-        agent,
-        user_message,
-        system_message,
-        conversation_history,
-        task_id,
-        stream_callback,
-        persist_user_message,
-        persist_user_timestamp,
-        persist_user_display_kind=persist_user_display_kind,
-        persist_user_display_metadata=persist_user_display_metadata,
-        restore_or_build_system_prompt=_restore_or_build_system_prompt,
-        install_safe_stdio=_install_safe_stdio,
-        sanitize_surrogates=_sanitize_surrogates,
-        summarize_user_message_for_log=_summarize_user_message_for_log,
-        set_session_context=set_session_context,
-        set_current_write_origin=set_current_write_origin,
-        ra=_ra,
-        # MoA turns append per-call aggregated context to the API copy of the
-        # user message, so no byte-stable api_content sidecar can be stamped.
-        moa_active=bool(moa_config),
-    )
+    with _turn_performance.phase("prologue"):
+        _ctx = build_turn_context(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+            restore_or_build_system_prompt=_restore_or_build_system_prompt,
+            install_safe_stdio=_install_safe_stdio,
+            sanitize_surrogates=_sanitize_surrogates,
+            summarize_user_message_for_log=_summarize_user_message_for_log,
+            set_session_context=set_session_context,
+            set_current_write_origin=set_current_write_origin,
+            ra=_ra,
+            # MoA turns append per-call aggregated context to the API copy of the
+            # user message, so no byte-stable api_content sidecar can be stamped.
+            moa_active=bool(moa_config),
+        )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages
@@ -1907,6 +1920,9 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # Close a request-preparation measurement left open by a compression or
+        # recovery continue before starting the next iteration's measurement.
+        _turn_performance.end_phase("request_prepare")
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -2033,6 +2049,7 @@ def run_conversation(
         # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
         # However, providers like Moonshot AI require a separate 'reasoning_content' field
         # on assistant messages with tool_calls. We handle both cases here.
+        _turn_performance.start_phase("request_prepare")
         request_logger = getattr(agent, "logger", None) or logging.getLogger(__name__)
         # Per-agent validation cursor: skips re-json.loads-ing tool_call
         # arguments on history messages already validated in a previous
@@ -2694,6 +2711,7 @@ def run_conversation(
             logging.debug(f"Last message role: {messages[-1]['role'] if messages else 'none'}")
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
+        _turn_performance.end_phase("request_prepare")
         api_start_time = time.time()
         retry_count = 0
         max_retries = agent._api_max_retries
@@ -3075,6 +3093,11 @@ def run_conversation(
                     break
                 
                 api_duration = time.time() - api_start_time
+                _turn_performance.record_api(
+                    api_duration,
+                    success=True,
+                    retries=retry_count,
+                )
                 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
@@ -4223,6 +4246,10 @@ def run_conversation(
                 break  # Success, exit retry loop
 
             except InterruptedError:
+                _turn_performance.record_api(
+                    time.time() - api_start_time,
+                    success=False,
+                )
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -4257,6 +4284,10 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                _turn_performance.record_api(
+                    time.time() - api_start_time,
+                    success=False,
+                )
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:

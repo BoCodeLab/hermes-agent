@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import SendResult, _thread_metadata_for_source
 
 
 class TestWeComRequirements:
@@ -28,6 +28,16 @@ class TestWeComAdapterInit:
         from plugins.platforms.wecom.adapter import WeComAdapter
 
         assert WeComAdapter.SUPPORTS_MESSAGE_EDITING is False
+
+    def test_thread_metadata_keeps_wecom_reply_anchor(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        source = adapter.build_source(chat_id="chat-123", chat_type="dm")
+
+        assert _thread_metadata_for_source(source, "msg-1") == {
+            "wecom_reply_to_message_id": "msg-1"
+        }
 
 
 class TestWeComConnect:
@@ -157,6 +167,23 @@ class TestExtractText:
         text, _reply_text = WeComAdapter._extract_text(body)
         assert text == "part1\npart2"
 
+    def test_extracts_quoted_markdown_for_approval_context(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        body = {
+            "msgtype": "text",
+            "text": {"content": "同意"},
+            "quote": {
+                "msgtype": "markdown",
+                "markdown": {"content": "申请编号：WA-ABCDEF12"},
+            },
+        }
+
+        text, reply_text = WeComAdapter._extract_text(body)
+
+        assert text == "同意"
+        assert reply_text == "申请编号：WA-ABCDEF12"
+
 
 class TestCallbackDispatch:
     @pytest.mark.asyncio
@@ -276,6 +303,45 @@ class TestMediaUpload:
 
 
 class TestSend:
+
+    @pytest.mark.asyncio
+    async def test_typing_stream_is_replaced_by_final_reply(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        adapter._send_reply_request = AsyncMock(
+            side_effect=[
+                {"headers": {"req_id": "req-1"}, "errcode": 0},
+                {"headers": {"req_id": "req-1"}, "errcode": 0},
+            ]
+        )
+
+        metadata = {"wecom_reply_to_message_id": "msg-1"}
+        await adapter.send_typing("chat-123", metadata=metadata)
+        await adapter.send_typing("chat-123", metadata=metadata)
+        result = await adapter.send("chat-123", "final answer", reply_to="msg-1")
+
+        assert result.success is True
+        assert adapter._send_reply_request.await_count == 2
+        first_body = adapter._send_reply_request.await_args_list[0].args[1]
+        final_body = adapter._send_reply_request.await_args_list[1].args[1]
+        assert first_body == {
+            "msgtype": "stream",
+            "stream": {
+                "id": first_body["stream"]["id"],
+                "finish": False,
+                "content": "",
+            },
+        }
+        assert final_body == {
+            "msgtype": "stream",
+            "stream": {
+                "id": first_body["stream"]["id"],
+                "finish": True,
+                "content": "final answer",
+            },
+        }
 
 
     @pytest.mark.asyncio
@@ -426,6 +492,141 @@ class TestWeComZombieSessionFix:
         assert args[1]["msgtype"] == "markdown"
         assert args[1]["markdown"]["content"] == "ping"
 
+    @pytest.mark.asyncio
+    async def test_force_proactive_send_ignores_stale_cached_req_id(self):
+        from plugins.platforms.wecom.adapter import APP_CMD_SEND, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._last_chat_req_ids["manager-chat"] = "stale-reply-token"
+        adapter._send_reply_request = AsyncMock()
+        adapter._send_request = AsyncMock(
+            return_value={"headers": {"req_id": "new-request"}, "errcode": 0}
+        )
+
+        result = await adapter.send(
+            "manager-chat",
+            "approval request",
+            metadata={"wecom_force_proactive": True},
+        )
+
+        assert result.success is True
+        adapter._send_reply_request.assert_not_awaited()
+        adapter._send_request.assert_awaited_once_with(
+            APP_CMD_SEND,
+            {
+                "chatid": "manager-chat",
+                "msgtype": "markdown",
+                "markdown": {"content": "approval request"},
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_reply_requests_for_one_inbound_req_id_are_serialized(self):
+        """Typing and final reply must not overwrite the same response future."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = SimpleNamespace(closed=False)
+        sent = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def fake_send_json(payload):
+            sent.append(payload)
+            if len(sent) == 1:
+                first_started.set()
+                await release_first.wait()
+            await adapter._dispatch_payload(
+                {
+                    "cmd": "aibot_respond_ack",
+                    "headers": {"req_id": "inbound-req"},
+                    "errcode": 0,
+                }
+            )
+
+        adapter._send_json = fake_send_json
+        first = asyncio.create_task(
+            adapter._send_reply_request(
+                "inbound-req",
+                {"msgtype": "stream", "stream": {"finish": False}},
+            )
+        )
+        await first_started.wait()
+        second = asyncio.create_task(
+            adapter._send_reply_request(
+                "inbound-req",
+                {"msgtype": "markdown", "markdown": {"content": "final"}},
+            )
+        )
+        await asyncio.sleep(0)
+        assert len(sent) == 1
+
+        release_first.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1.0)
+        assert len(sent) == 2
+
+    @pytest.mark.asyncio
+    async def test_late_typing_does_not_recreate_finished_reply(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._last_chat_req_ids["chat-1"] = "req-1"
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+
+        result = await adapter.send("chat-1", "final")
+        assert result.success is True
+
+        await adapter.send_typing("chat-1")
+
+        adapter._send_reply_request.assert_awaited_once()
+        assert "req-1" in adapter._finished_reply_req_ids
+
+    @pytest.mark.asyncio
+    async def test_typing_frame_is_skipped_when_final_reply_is_in_flight(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._ws = SimpleNamespace(closed=False)
+        adapter._finalizing_reply_req_ids.add("req-1")
+        adapter._send_json = AsyncMock()
+
+        response = await adapter._send_reply_request(
+            "req-1",
+            {"msgtype": "stream", "stream": {"finish": False}},
+        )
+
+        assert response["_hermes_typing_skipped"] is True
+        adapter._send_json.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fast_final_send_prevents_late_typing_bubble(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._last_chat_req_ids["chat-1"] = "req-1"
+        final_started = asyncio.Event()
+        release_final = asyncio.Event()
+
+        async def fake_reply_request(req_id, body):
+            assert req_id == "req-1"
+            assert body["msgtype"] == "markdown"
+            final_started.set()
+            await release_final.wait()
+            return {"headers": {"req_id": req_id}, "errcode": 0}
+
+        adapter._send_reply_request = fake_reply_request
+        final_task = asyncio.create_task(adapter.send("chat-1", "final"))
+        await final_started.wait()
+
+        await adapter.send_typing("chat-1")
+        assert adapter._reply_stream_ids == {}
+
+        release_final.set()
+        result = await final_task
+        assert result.success is True
+
 
 class TestTextBatchFlushRace:
     """Regression tests for the cancel-delivery race in _flush_text_batch.
@@ -482,4 +683,3 @@ class TestTextBatchFlushRace:
         assert adapter._pending_text_batches.get(key) is event, (
             "superseded task must not pop the event"
         )
-

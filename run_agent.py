@@ -4265,17 +4265,21 @@ class AIAgent:
         provenance = getattr(self, "_last_activity_provenance", None)
         if provenance is None:
             provenance = ActivityProvenance.UNKNOWN
-        return build_activity_snapshot(
-            last_activity_at=getattr(self, "_last_activity_ts", None),
-            last_activity_description=getattr(self, "_last_activity_desc", None) or "",
-            last_activity_provenance=provenance,
-            extra={
+        extra = {
             "current_tool": self._current_tool,
             "api_call_count": self._api_call_count,
             "max_iterations": self.max_iterations,
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
-            },
+        }
+        performance = getattr(self, "_turn_performance", None)
+        if performance is not None:
+            extra["turn_performance"] = performance.snapshot()
+        return build_activity_snapshot(
+            last_activity_at=getattr(self, "_last_activity_ts", None),
+            last_activity_description=getattr(self, "_last_activity_desc", None) or "",
+            last_activity_provenance=provenance,
+            extra=extra,
         )
 
     def shutdown_memory_provider(self, messages: list = None) -> None:

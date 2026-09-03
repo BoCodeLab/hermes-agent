@@ -370,6 +370,9 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert result["turn_exit_reason"].startswith("text_response")
     assert "guardrail" not in result
     assert result["final_response"] == "done"
+    assert result["performance"]["api_calls"] == 4
+    assert result["performance"]["wall_ms"] >= 0
+    assert "request_prepare" in result["performance"]["phases_ms"]
     tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 

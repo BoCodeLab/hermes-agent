@@ -619,6 +619,46 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
     except Exception:
         return f"<{type(command).__name__}>"
 
+
+_WORK_SESSION_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?:^|[;&|]\s*)(?:export\s+|set\s+|env\s+)*"
+    r"HERMES_SESSION_(?:PLATFORM|USER_ID|CHAT_ID)\s*="
+)
+_WORK_SESSION_UNSET_RE = re.compile(
+    r"(?i)(?:^|[;&|]\s*)(?:unset|set\s+-u)\s+"
+    r"HERMES_SESSION_(?:PLATFORM|USER_ID|CHAT_ID)(?:\s|$)"
+)
+
+
+def _work_session_identity_override_error(command: str) -> str | None:
+    """Reject shell commands that can erase a scoped Work identity."""
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+        profile = str(get_session_env("HERMES_SESSION_PROFILE", "") or "").strip().lower()
+        user_id = str(get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
+        chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    except Exception:
+        platform = str(os.getenv("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+        profile = str(os.getenv("HERMES_SESSION_PROFILE", "") or "").strip().lower()
+        user_id = str(os.getenv("HERMES_SESSION_USER_ID", "") or "").strip()
+        chat_id = str(os.getenv("HERMES_SESSION_CHAT_ID", "") or "").strip()
+
+    if not (
+        platform == "wecom"
+        or (profile == "work" and (user_id or chat_id))
+    ):
+        return None
+    if _WORK_SESSION_ASSIGNMENT_RE.search(command) or _WORK_SESSION_UNSET_RE.search(command):
+        return (
+            "Blocked: a Work WeCom session cannot override or clear its "
+            "HERMES_SESSION identity. Run the query without changing "
+            "HERMES_SESSION_PLATFORM/USER_ID/CHAT_ID so the current user's "
+            "credentials and login state remain isolated."
+        )
+    return None
+
 def _looks_like_env_assignment(token: str) -> bool:
     """Return True when *token* is a leading shell environment assignment."""
     if "=" not in token or token.startswith("="):
@@ -2655,6 +2695,16 @@ def terminal_tool(
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
+            }, ensure_ascii=False)
+
+        identity_override_error = _work_session_identity_override_error(command)
+        if identity_override_error:
+            logger.warning("Blocked Work session identity override in terminal command")
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": identity_override_error,
+                "status": "blocked",
             }, ensure_ascii=False)
 
         # Get configuration

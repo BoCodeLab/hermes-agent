@@ -142,6 +142,13 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    _performance = getattr(agent, "_turn_performance", None)
+    if _performance is not None:
+        try:
+            _performance.start_phase("finalizer")
+        except Exception:
+            _performance = None
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -832,5 +839,38 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+
+    if _performance is not None:
+        try:
+            _performance.end_phase("request_prepare")
+            _performance.end_phase("finalizer")
+            _performance_summary = _performance.finish(
+                exit_reason=_turn_exit_reason,
+                prompt_tokens=getattr(agent, "session_prompt_tokens", 0),
+                input_tokens=getattr(agent, "session_input_tokens", 0),
+                output_tokens=getattr(agent, "session_output_tokens", 0),
+                reasoning_tokens=getattr(agent, "session_reasoning_tokens", 0),
+                max_iterations=getattr(agent, "max_iterations", 0),
+            )
+            result["performance"] = _performance_summary
+            logger.info(
+                "Turn performance: wall=%dms api=%dms tools=%dms overhead=%dms "
+                "api_calls=%d tool_calls=%d retries=%d prompt=%d output=%d reasoning=%d "
+                "phases=%s top_tools=%s",
+                _performance_summary["wall_ms"],
+                _performance_summary["api_ms"],
+                _performance_summary["tool_ms"],
+                _performance_summary["overhead_ms"],
+                _performance_summary["api_calls"],
+                _performance_summary["tool_calls"],
+                _performance_summary["api_retries"],
+                _performance_summary["prompt_tokens"],
+                _performance_summary["output_tokens"],
+                _performance_summary["reasoning_tokens"],
+                _performance_summary["phases_ms"],
+                _performance_summary["top_tools"],
+            )
+        except Exception:
+            logger.debug("turn performance finalization failed", exc_info=True)
 
     return result

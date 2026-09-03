@@ -104,6 +104,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    if _platform_name(getattr(source, "platform", None)) == "wecom" and reply_to_message_id:
+        metadata["wecom_reply_to_message_id"] = str(reply_to_message_id)
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
@@ -6304,6 +6306,15 @@ class BasePlatformAdapter(ABC):
                     "[%s] Suppressing stale response for interrupted session %s",
                     self.name,
                     session_key,
+                )
+                response = None
+            if response and (event.metadata or {}).get("suppress_text_reply"):
+                # 卡片交互（如「刷新余额」）的合成事件：卡片已由 agent 用
+                # 工具独立发送到群里，agent 剩余的纯文字回复（“卡片已发送”
+                # 之类）不应再发一条。丢弃文本回复，避免群里出现多余消息。
+                logger.info(
+                    "[%s] Suppressing text reply for card-action synthetic event in %s",
+                    self.name, event.source.chat_id,
                 )
                 response = None
             if not response:
